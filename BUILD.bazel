@@ -7,3 +7,5 @@ buildifier(
     ],
     lint_mode = "fix",
 )
+
+exports_files(["LICENSE"])
