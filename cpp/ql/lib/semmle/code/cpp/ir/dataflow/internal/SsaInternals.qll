@@ -2,34 +2,25 @@ private import codeql.ssa.Ssa as SsaImplCommon
 private import semmle.code.cpp.ir.IR
 private import DataFlowUtil
 private import DataFlowImplCommon as DataFlowImplCommon
-private import semmle.code.cpp.ir.dataflow.internal.ModelUtil
 private import semmle.code.cpp.models.interfaces.Allocation as Alloc
 private import semmle.code.cpp.models.interfaces.DataFlow as DataFlow
-private import semmle.code.cpp.models.interfaces.FlowOutBarrier as FOB
+private import semmle.code.cpp.models.interfaces.Taint as Taint
+private import semmle.code.cpp.models.interfaces.PartialFlow as PartialFlow
 private import semmle.code.cpp.models.interfaces.FunctionInputsAndOutputs as FIO
 private import semmle.code.cpp.ir.internal.IRCppLanguage
+private import semmle.code.cpp.ir.dataflow.internal.ModelUtil
 private import DataFlowPrivate
-private import ssa0.SsaInternals as SsaInternals0
 import SsaInternalsCommon
 
 private module SourceVariables {
   cached
   private newtype TSourceVariable =
-    TMkSourceVariable(SsaInternals0::SourceVariable base, int ind) {
+    TMkSourceVariable(BaseSourceVariable base, int ind) {
       ind = [0 .. countIndirectionsForCppType(base.getLanguageType()) + 1]
     }
 
-  private int maxNumberOfIndirections() { result = max(SourceVariable sv | | sv.getIndirection()) }
-
-  private string repeatStars(int n) {
-    n = 0 and result = ""
-    or
-    n = [1 .. maxNumberOfIndirections()] and
-    result = "*" + repeatStars(n - 1)
-  }
-
   class SourceVariable extends TSourceVariable {
-    SsaInternals0::SourceVariable base;
+    BaseSourceVariable base;
     int ind;
 
     SourceVariable() { this = TMkSourceVariable(base, ind) }
@@ -41,7 +32,7 @@ private module SourceVariables {
      * Gets the base source variable (i.e., the variable without any
      * indirections) of this source variable.
      */
-    SsaInternals0::SourceVariable getBaseVariable() { result = base }
+    BaseSourceVariable getBaseVariable() { result = base }
 
     /** Gets a textual representation of this element. */
     string toString() { result = repeatStars(this.getIndirection()) + base.toString() }
@@ -74,17 +65,26 @@ private module SourceVariables {
 import SourceVariables
 
 /**
- * Holds if the `(operand, indirectionIndex)` columns should be
- * assigned a `RawIndirectOperand` value.
+ * Holds if `indirectionIndex` is a valid non-zero indirection index for
+ * operand `op`. That is, `indirectionIndex` is between 1 and the maximum
+ * indirection for the operand's type.
  */
-predicate hasRawIndirectOperand(Operand op, int indirectionIndex) {
+predicate hasIndirectOperand(Operand op, int indirectionIndex) {
   exists(CppType type, int m |
     not ignoreOperand(op) and
     type = getLanguageType(op) and
     m = countIndirectionsForCppType(type) and
-    indirectionIndex = [1 .. m] and
-    not hasIRRepresentationOfIndirectOperand(op, indirectionIndex, _, _)
+    indirectionIndex = [1 .. m]
   )
+}
+
+/**
+ * Holds if the `(operand, indirectionIndex)` columns should be
+ * assigned a `RawIndirectOperand` value.
+ */
+predicate hasRawIndirectOperand(Operand op, int indirectionIndex) {
+  hasIndirectOperand(op, indirectionIndex) and
+  not hasIRRepresentationOfIndirectOperand(op, indirectionIndex, _, _)
 }
 
 /**
@@ -103,17 +103,9 @@ predicate hasRawIndirectInstruction(Instruction instr, int indirectionIndex) {
 
 cached
 private newtype TDefOrUseImpl =
+  TDefAddressImpl(BaseIRVariable v) or
   TDefImpl(BaseSourceVariableInstruction base, Operand address, int indirectionIndex) {
-    isDef(_, _, address, base, _, indirectionIndex) and
-    (
-      // We only include the definition if the SSA pruning stage
-      // concluded that the definition is live after the write.
-      any(SsaInternals0::Def def).getAddressOperand() = address
-      or
-      // Since the pruning stage doesn't know about global variables we can't use the above check to
-      // rule out dead assignments to globals.
-      base.(VariableAddressInstruction).getAstVariable() instanceof GlobalLikeVariable
-    )
+    isDef(_, _, address, base, _, indirectionIndex)
   } or
   TUseImpl(BaseSourceVariableInstruction base, Operand operand, int indirectionIndex) {
     isUse(_, operand, base, _, indirectionIndex) and
@@ -132,8 +124,7 @@ private newtype TDefOrUseImpl =
   TIteratorDef(
     Operand iteratorDerefAddress, BaseSourceVariableInstruction container, int indirectionIndex
   ) {
-    isIteratorDef(container, iteratorDerefAddress, _, _, indirectionIndex) and
-    any(SsaInternals0::Def def | def.isIteratorDef()).getAddressOperand() = iteratorDerefAddress
+    isIteratorDef(container, iteratorDerefAddress, _, _, indirectionIndex)
   } or
   TIteratorUse(
     Operand iteratorAddress, BaseSourceVariableInstruction container, int indirectionIndex
@@ -141,12 +132,11 @@ private newtype TDefOrUseImpl =
     isIteratorUse(container, iteratorAddress, _, indirectionIndex)
   } or
   TFinalParameterUse(Parameter p, int indirectionIndex) {
-    // Avoid creating parameter nodes if there is no definitions of the variable other than the initializaion.
-    exists(SsaInternals0::Def def |
-      def.getSourceVariable().getBaseVariable().(BaseIRVariable).getIRVariable().getAst() = p and
-      not def.getValue().asInstruction() instanceof InitializeParameterInstruction and
-      unspecifiedTypeIsModifiableAt(p.getUnspecifiedType(), indirectionIndex)
-    )
+    underlyingTypeIsModifiableAt(p.getUnderlyingType(), indirectionIndex) and
+    // Only create an SSA read for the final use of a parameter if there's
+    // actually a body of the enclosing function. If there's no function body
+    // then we'll never need to flow out of the function anyway.
+    p.getFunction().hasDefinition()
   }
 
 private predicate isGlobalUse(
@@ -175,11 +165,13 @@ private predicate isGlobalDefImpl(
   )
 }
 
-private predicate unspecifiedTypeIsModifiableAt(Type unspecified, int indirectionIndex) {
-  indirectionIndex = [1 .. getIndirectionForUnspecifiedType(unspecified).getNumberOfIndirections()] and
+private predicate underlyingTypeIsModifiableAt(Type underlying, int indirectionIndex) {
+  indirectionIndex =
+    [1 .. getIndirectionForUnspecifiedType(underlying.getUnspecifiedType())
+          .getNumberOfIndirections()] and
   exists(CppType cppType |
-    cppType.hasUnspecifiedType(unspecified, _) and
-    isModifiableAt(cppType, indirectionIndex + 1)
+    cppType.hasUnderlyingType(underlying, false) and
+    isModifiableAt(cppType, indirectionIndex)
   )
 }
 
@@ -265,23 +257,63 @@ private predicate sourceVariableHasBaseAndIndex(SourceVariable v, BaseSourceVari
 }
 
 abstract class DefImpl extends DefOrUseImpl {
-  Operand address;
   int ind;
 
   bindingset[ind]
   DefImpl() { any() }
 
-  abstract int getIndirection();
-
-  abstract Node0Impl getValue();
-
-  abstract predicate isCertain();
-
-  Operand getAddressOperand() { result = address }
-
   override int getIndirectionIndex() { result = ind }
 
   override string toString() { result = "Def of " + this.getSourceVariable() }
+
+  abstract int getIndirection();
+
+  abstract predicate isCertain();
+
+  abstract Node0Impl getValue();
+}
+
+/** An initial definition of an `IRVariable`'s address. */
+private class DefAddressImpl extends DefImpl, TDefAddressImpl {
+  BaseIRVariable v;
+
+  DefAddressImpl() {
+    this = TDefAddressImpl(v) and
+    ind = 0
+  }
+
+  final override int getIndirection() { result = 0 }
+
+  final override predicate isCertain() { any() }
+
+  final override Node0Impl getValue() { none() }
+
+  final override predicate hasIndexInBlock(IRBlock block, int index) {
+    block = v.getIRVariable().getEnclosingIRFunction().getEntryBlock() and
+    index = 0
+  }
+
+  override Cpp::Location getLocation() { result = v.getIRVariable().getLocation() }
+
+  final override SourceVariable getSourceVariable() {
+    result.getBaseVariable() = v and
+    result.getIndirection() = 0
+  }
+
+  final override BaseSourceVariableInstruction getBase() { none() }
+}
+
+/**
+ * An SSA definition that has an associated `Operand` representing the address
+ * that is being written to.
+ */
+abstract private class OperandBasedDef extends DefImpl {
+  Operand address;
+
+  bindingset[ind]
+  OperandBasedDef() { any() }
+
+  Operand getAddressOperand() { result = address }
 
   override Cpp::Location getLocation() { result = this.getAddressOperand().getUse().getLocation() }
 
@@ -290,7 +322,7 @@ abstract class DefImpl extends DefOrUseImpl {
   }
 }
 
-private class DirectDef extends DefImpl, TDefImpl {
+private class DirectDef extends OperandBasedDef, TDefImpl {
   BaseSourceVariableInstruction base;
 
   DirectDef() { this = TDefImpl(base, address, ind) }
@@ -304,7 +336,7 @@ private class DirectDef extends DefImpl, TDefImpl {
   override predicate isCertain() { isDef(true, _, address, base, _, ind) }
 }
 
-private class IteratorDef extends DefImpl, TIteratorDef {
+private class IteratorDef extends OperandBasedDef, TIteratorDef {
   BaseSourceVariableInstruction container;
 
   IteratorDef() { this = TIteratorDef(address, container, ind) }
@@ -410,6 +442,8 @@ class FinalParameterUse extends UseImpl, TFinalParameterUse {
   FinalParameterUse() { this = TFinalParameterUse(p, ind) }
 
   Parameter getParameter() { result = p }
+
+  int getArgumentIndex() { result = p.getIndex() }
 
   override Node getNode() { finalParameterNodeHasParameterAndIndex(result, p, ind) }
 
@@ -797,14 +831,42 @@ private Node getAPriorDefinition(SsaDefOrUse defOrUse) {
   )
 }
 
+private predicate inOut(FIO::FunctionInput input, FIO::FunctionOutput output) {
+  exists(int indirectionIndex |
+    input.isQualifierObject(indirectionIndex) and
+    output.isQualifierObject(indirectionIndex)
+    or
+    exists(int i |
+      input.isParameterDeref(i, indirectionIndex) and
+      output.isParameterDeref(i, indirectionIndex)
+    )
+  )
+}
+
 /**
- * Holds if there should not be use-use flow out of `n` (or a conversion that
- * flows to `n`).
+ * Holds if there should not be use-use flow out of `n`. That is, `n` is
+ * an out-barrier to use-use flow. This includes:
+ *
+ * - an input to a call that would be assumed to have use-use flow to the same
+ *   argument as an output, but this flow should be blocked because the
+ *   function is modeled with another flow to that output (for example the
+ *   first argument of `strcpy`).
+ * - a conversion that flows to such an input.
  */
 private predicate modeledFlowBarrier(Node n) {
-  exists(FIO::FunctionInput input, CallInstruction call |
-    call.getStaticCallTarget().(FOB::FlowOutBarrierFunction).isFlowOutBarrier(input) and
-    n = callInput(call, input)
+  exists(
+    FIO::FunctionInput input, FIO::FunctionOutput output, CallInstruction call,
+    PartialFlow::PartialFlowFunction partialFlowFunc
+  |
+    n = callInput(call, input) and
+    inOut(input, output) and
+    exists(callOutput(call, output)) and
+    partialFlowFunc = call.getStaticCallTarget() and
+    not partialFlowFunc.isPartialWrite(output)
+  |
+    call.getStaticCallTarget().(DataFlow::DataFlowFunction).hasDataFlow(_, output)
+    or
+    call.getStaticCallTarget().(Taint::TaintFunction).hasTaintFlow(_, output)
   )
   or
   exists(Operand operand, Instruction instr, Node n0, int indirectionIndex |
@@ -831,7 +893,7 @@ private predicate isArgumentOfCallableInstruction(DataFlowCall call, Instruction
 }
 
 private predicate isArgumentOfCallableOperand(DataFlowCall call, Operand operand) {
-  operand.(ArgumentOperand).getCall() = call
+  operand = call.getArgumentOperand(_)
   or
   exists(FieldAddressInstruction fai |
     fai.getObjectAddressOperand() = operand and
@@ -954,17 +1016,6 @@ predicate fromPhiNode(SsaPhiNode nodeFrom, Node nodeTo) {
   )
 }
 
-/**
- * Holds if there is a write at index `i` in basic block `bb` to variable `v` that's
- * subsequently read (as determined by the SSA pruning stage).
- */
-private predicate variableWriteCand(IRBlock bb, int i, SourceVariable v) {
-  exists(SsaInternals0::Def def, SsaInternals0::SourceVariable v0 |
-    def.asDefOrUse().hasIndexInBlock(bb, i, v0) and
-    v0 = v.getBaseVariable()
-  )
-}
-
 private predicate sourceVariableIsGlobal(
   SourceVariable sv, GlobalLikeVariable global, IRFunction func, int indirectionIndex
 ) {
@@ -988,16 +1039,14 @@ private module SsaInput implements SsaImplCommon::InputSig<Location> {
   predicate variableWrite(IRBlock bb, int i, SourceVariable v, boolean certain) {
     DataFlowImplCommon::forceCachingInSameStage() and
     (
-      variableWriteCand(bb, i, v) or
-      sourceVariableIsGlobal(v, _, _, _)
-    ) and
-    exists(DefImpl def | def.hasIndexInBlock(bb, i, v) |
-      if def.isCertain() then certain = true else certain = false
-    )
-    or
-    exists(GlobalDefImpl global |
-      global.hasIndexInBlock(bb, i, v) and
-      certain = true
+      exists(DefImpl def | def.hasIndexInBlock(bb, i, v) |
+        if def.isCertain() then certain = true else certain = false
+      )
+      or
+      exists(GlobalDefImpl global |
+        global.hasIndexInBlock(bb, i, v) and
+        certain = true
+      )
     )
   }
 
@@ -1172,7 +1221,7 @@ class UseOrPhi extends SsaDefOrUse {
 class Def extends DefOrUse {
   override DefImpl defOrUse;
 
-  Operand getAddressOperand() { result = defOrUse.getAddressOperand() }
+  Operand getAddressOperand() { result = defOrUse.(OperandBasedDef).getAddressOperand() }
 
   Instruction getAddress() { result = this.getAddressOperand().getDef() }
 
