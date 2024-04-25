@@ -713,7 +713,7 @@ void test() {
   for(auto it = v.begin(); it != v.end(); ++it) {} // GOOD
   }
 
-  for (auto x : return_self_by_ref(returnValue())) {} // BAD
+  for (auto x : return_self_by_ref(returnValue())) {} // BAD [NOT DETECTED]
 
   for (auto x : return_self_by_value(returnValue())) {} // GOOD
 }
@@ -768,6 +768,28 @@ void test2() {
 }
 
 void test3() {
-  const std::vector<std::vector<int>>& v = returnValue(); // GOOD [FALSE POSITIVE]
+  const std::vector<std::vector<int>>& v = returnValue(); // GOOD
   for(const std::vector<int>& x : v) {}
+}
+
+struct A : public std::vector<int> {
+  void foo(std::vector<int>& result) {
+    int i = 0;
+    while (i < 10) {
+      A chunk;
+      result.insert(result.end(), chunk.begin(), chunk.end());
+      ++i;
+    }
+  }
+
+  ~A() = default;
+};
+
+void test4() {
+  // This creates a temporary, after which `~A` is called at the semicolon, and
+  // `~A` calls `~vector<int>` inside the compiler-generated destructor.
+  // If we don't preserve the call context and return to the destructor call in this
+  // function we may end up in the destructor call `chunk.~A()`in `A.foo`. This destructor
+  // call can flow to `begin` through the back-edge and cause a strange FP.
+  auto zero = A().size();
 }
